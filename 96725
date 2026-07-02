@@ -1,0 +1,184 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+
+// Tiny built-in .env loader — avoids needing the `dotenv` package.
+// Most hosts (Render, Railway, cPanel Node app) let you set env vars in
+// their dashboard instead, in which case this file is simply skipped.
+(function loadEnvFile() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return;
+  const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (!(key in process.env)) process.env[key] = value;
+  }
+})();
+
+const Router = require('./lib/router');
+const { verifyToken } = require('./lib/auth');
+
+const authRoutes = require('./routes/auth');
+const customerRoutes = require('./routes/customer');
+const riderRoutes = require('./routes/rider');
+const adminRoutes = require('./routes/admin');
+const trackRoutes = require('./routes/track');
+
+const PORT = process.env.PORT || 3000;
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const MAX_BODY_BYTES = 15 * 1024 * 1024; // 15MB, enough for a couple of photo uploads
+
+const router = new Router();
+
+// Auth middleware factory. Usage: router.get(path, requireAuth('rider'), handler)
+// If role is omitted, any authenticated user may access the route.
+function requireAuth(role) {
+  return async (req, res) => {
+    const header = req.headers['authorization'] || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    const payload = token ? verifyToken(token) : null;
+    if (!payload) {
+      res.json(401, { error: 'You must be signed in to do that.' });
+      return false;
+    }
+    if (role && payload.role !== role) {
+      res.json(403, { error: 'You do not have permission to do that.' });
+      return false;
+    }
+    req.user = payload;
+    return true;
+  };
+}
+
+authRoutes.register(router);
+customerRoutes.register(router, requireAuth);
+riderRoutes.register(router, requireAuth);
+adminRoutes.register(router, requireAuth);
+trackRoutes.register(router);
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf',
+};
+
+function serveStatic(req, res, rootDir, urlPath) {
+  const safePath = path.normalize(urlPath).replace(/^(\.\.[/\\])+/, '');
+  const filePath = path.join(rootDir, safePath);
+  if (!filePath.startsWith(rootDir)) {
+    res.writeHead(403); res.end('Forbidden'); return true;
+  }
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream' });
+  fs.createReadStream(filePath).pipe(res);
+  return true;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  res.json = (status, data) => {
+    if (res.headersSent) return;
+    const payload = JSON.stringify(data);
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(payload);
+  };
+
+  try {
+    const parsed = url.parse(req.url);
+    const pathname = decodeURIComponent(parsed.pathname);
+
+    // Static: uploaded files (NIN slips, passports, receipts)
+    if (pathname.startsWith('/uploads/')) {
+      const served = serveStatic(req, res, UPLOAD_DIR, pathname.replace('/uploads', ''));
+      if (served) return;
+      res.writeHead(404); res.end('Not found'); return;
+    }
+
+    // API routes
+    if (pathname.startsWith('/api/')) {
+      const match = router.match(req.method, pathname);
+      if (!match) return res.json(404, { error: 'Unknown API route.' });
+
+      let body = {};
+      if (req.method === 'POST') {
+        let raw;
+        try {
+          raw = await readBody(req);
+        } catch (e) {
+          return res.json(413, { error: 'Upload too large.' });
+        }
+        if (raw.length) {
+          try {
+            body = JSON.parse(raw.toString('utf8'));
+          } catch {
+            return res.json(400, { error: 'Invalid JSON body.' });
+          }
+        }
+      }
+
+      req.params = match.params;
+      for (const handler of match.handlers) {
+        const result = await handler(req, res, body);
+        if (result === false || res.headersSent) return;
+      }
+      return;
+    }
+
+    // Static site: public/ pages
+    const routeMap = {
+      '/': 'index.html',
+      '/customer': 'customer-dashboard.html',
+      '/rider': 'rider-dashboard.html',
+      '/admin': 'admin-dashboard.html',
+    };
+    const target = routeMap[pathname] || pathname.slice(1);
+    const served = serveStatic(req, res, PUBLIC_DIR, '/' + target);
+    if (served) return;
+
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found');
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.json(500, { error: 'Something went wrong on our end.' });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`MaidXpress backend running on http://localhost:${PORT}`);
+  console.log(`  Marketing site:    http://localhost:${PORT}/`);
+  console.log(`  Customer dashboard: http://localhost:${PORT}/customer`);
+  console.log(`  Rider dashboard:    http://localhost:${PORT}/rider`);
+  console.log(`  Admin dashboard:    http://localhost:${PORT}/admin`);
+});

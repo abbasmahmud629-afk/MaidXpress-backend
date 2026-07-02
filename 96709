@@ -1,0 +1,139 @@
+# MaidXpress Logistics — Backend
+
+A working backend for MaidXpress: customer bookings, rider registration/approval,
+delivery assignment, live GPS status updates, a rider wallet, and an admin dashboard.
+
+**Zero external dependencies.** No `npm install` needed — it runs on plain Node.js
+(v18+), which is why it can be deployed almost anywhere for free.
+
+## What's included
+
+| Piece | Where |
+|---|---|
+| Marketing site (your existing homepage) | `public/index.html` — now wired to live booking/tracking/rider forms |
+| Customer dashboard | `/customer` — register, log in, book deliveries, view history |
+| Rider dashboard | `/rider` — accept jobs, update status with live GPS, wallet & withdrawals |
+| Admin dashboard | `/admin` — approve riders, assign deliveries, confirm payments, approve withdrawals, promo codes, analytics |
+| API | `routes/*.js` — see **API reference** below |
+| Data storage | `data/*.json` — plain JSON files (see **About the database** below) |
+| Uploaded files | `uploads/` — NIN slips, passport photos, payment receipts |
+
+## Running it locally
+
+```bash
+node server.js
+```
+
+Then open `http://localhost:3000`. No install step required.
+
+The **admin login** defaults to:
+- Email: `admin@maidxpress.com`
+- Password: `ChangeMe123!`
+
+**Change this before going live** — copy `.env.example` to `.env` and set your own
+`ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `JWT_SECRET` (a long random string).
+
+## Deploying it (you said you don't have hosting yet)
+
+The easiest free option for a Node app like this is **Render**:
+
+1. Create a free account at render.com
+2. Push this folder to a GitHub repository (or use Render's "upload" option if available)
+3. In Render, click **New → Web Service**, connect the repo
+4. Build command: leave blank (nothing to build)
+5. Start command: `node server.js`
+6. Add environment variables: `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `JWT_SECRET`
+7. **Important:** under the service's settings, add a **persistent disk** mounted at
+   `/opt/render/project/src/data` and another at `.../uploads` — otherwise every
+   redeploy wipes your customers, riders, and delivery history. (Render's free tier
+   disk is small but plenty for JSON files and a modest number of photos.)
+
+Railway, Fly.io, and a basic VPS (e.g. DigitalOcean, Hostinger) all work the same
+way — just `node server.js`, keep the `data/` and `uploads/` folders on persistent
+storage, and set the same environment variables.
+
+**cPanel note:** if you end up on shared cPanel hosting instead, check whether it
+offers "Setup Node.js App" — if it does, this same code runs there too. If your
+host only supports PHP, this backend would need to be rewritten in PHP; let me
+know if that's the direction you go and I'll port it over.
+
+## About the database
+
+Right now this uses JSON files instead of a real database (Postgres/MySQL) —
+that was a deliberate choice so you could deploy it immediately with zero setup
+and zero cost. It's genuinely fine for getting started and testing with real
+riders and customers.
+
+**When to upgrade:** once you're regularly getting bookings — say, more than a
+few dozen a day, or once you have several people on staff hitting the admin
+dashboard at once — move to a real database to avoid write conflicts and to get
+proper backups. I kept `lib/store.js` as the one file where all data reads/writes
+happen, specifically so that swapping it for Postgres later doesn't require
+touching the rest of the app.
+
+## Payments
+
+There's no payment gateway wired in yet — this matches how you described the
+flow: customers and riders pay directly into your OPay account, then confirm by
+sending a receipt on WhatsApp. The admin dashboard's **Deliveries** tab has a
+"Confirm payment" button for exactly that manual step.
+
+When you're ready for customers to pay by card in-app instead, the natural
+next step is **Paystack** or **Flutterwave** — both have Nigerian bank/OPay
+payout support and a straightforward API. I can wire that in whenever you want.
+
+## Live tracking
+
+Tracking is real, not simulated — the rider dashboard requests the rider's
+actual GPS location from their phone's browser (`navigator.geolocation`) and
+posts it to the server, which the public tracking page then reads. No Google
+Maps key or paid API needed for this to work; if you later want a visual map
+instead of raw coordinates, Leaflet + OpenStreetMap (also free) is the natural
+next step.
+
+## API reference
+
+All authenticated routes expect `Authorization: Bearer <token>`, returned from
+`/api/auth/login`.
+
+**Auth**
+- `POST /api/auth/register-customer`
+- `POST /api/auth/register-rider` (NIN slip / passport sent as base64 data URIs)
+- `POST /api/auth/login`
+
+**Customer**
+- `POST /api/customer/deliveries` — book a delivery, returns a tracking number
+- `GET /api/customer/deliveries` — booking history
+- `POST /api/customer/deliveries/:id/receipt` — attach a receipt image
+
+**Rider**
+- `GET /api/rider/deliveries/available`
+- `POST /api/rider/deliveries/:id/accept`
+- `POST /api/rider/deliveries/:id/status` — `{status, lat, lng}`
+- `POST /api/rider/location` — periodic GPS ping
+- `GET /api/rider/wallet`
+- `POST /api/rider/wallet/withdraw`
+
+**Admin**
+- `GET/POST /api/admin/riders`, `/approve`, `/reject`
+- `GET /api/admin/customers`
+- `GET /api/admin/deliveries`, `/assign`, `/confirm-payment`
+- `GET /api/admin/withdrawals`, `/approve`, `/reject`
+- `GET /api/admin/analytics`
+- `GET/POST /api/admin/promo-codes`
+
+**Public**
+- `GET /api/track/:trackingNumber`
+
+## What's intentionally not built yet
+
+Being upfront about scope: a few things from the original spec need real-world
+accounts/credentials I don't have, or are genuinely separate projects:
+
+- **Native mobile apps** (Android/iPhone) — this is a mobile-friendly website;
+  a true native app is a separate build.
+- **Automated bank payouts** — withdrawal *requests* work end-to-end, but
+  actually moving money still needs you (or a payment gateway's payout API)
+  to act on them.
+- **AI delivery assistant / voice booking / multi-language** — future-features
+  list from the brief; happy to scope these next once the core platform is live.
